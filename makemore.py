@@ -108,10 +108,30 @@ def sample(p, words):
 	#print(ix)
 	return ix
 
+def normalize_N(N):
+
+	# Add 1 for model smoothing. Ensures no 0s in probability matrix,
+	# so nothing with infinity unlikelihood.
+	P = (N+1).float()
+
+	P /= P.sum(1, keepdim=True) # 27 x 1 matrix of counts
+	# divide 27x27 matrix by 27x1 matrix
+	# P.sum(1) gives you sums of rows. Keepdim keeps it as rows.
+
+	# takes dimension 1 to match 27, so they're both 27x27, then
+	# does element-wise division
+	# PyTorch has very specific rules for broadcasting like this.
+
+	# If you didn't have keepdim, it would just be length 27, which would
+	# be broadcast as 1x27. That would normalize the columns instead of rows.
+
+	return P
 
 def sample_words(words, samples):
 
 	N = get_bigram_matrix(words)
+
+	P = normalize_N(N)
 
 	g = torch.Generator().manual_seed(2147483647)
 
@@ -121,7 +141,7 @@ def sample_words(words, samples):
 
 		while True:
 
-			p = normalize_row(N, ix)
+			p = P[ix]
 			ix = torch.multinomial(p, num_samples=1, replacement=True, generator=g).item()
 
 			out.append(get_itos(words)[ix])
@@ -131,4 +151,51 @@ def sample_words(words, samples):
 		print(''.join(out))
 	#return out
 
-sample_words(words, 10)
+#sample_words(words, 10)
+
+
+# How do you evaluate the quality of the model in one number?
+
+# Returns log likelihood
+def evaluate(words, num_words):
+	N = get_bigram_matrix(words)
+
+	P = normalize_N(N)
+
+	chars = sorted(list(set(''.join(words))))
+
+	stoi = get_stoi(words)
+
+	itos = get_itos(words)
+
+	likelihood = 1
+	log_likelihood = 0.0
+	n = 0
+
+	for w in words[:num_words]:
+
+		chs = ['.'] + list(w) + ['.']
+		for ch1, ch2 in zip(chs, chs[1:]):
+			ix1 = stoi[ch1]
+			ix2 = stoi[ch2]
+			prob = P[ix1, ix2]
+
+			likelihood *= prob
+			log_prob = torch.log(prob)
+			log_likelihood += log_prob
+			n += 1
+
+			print(f'{ch1}{ch2}: {prob:.4f} {log_prob:.4f}')
+
+	nll = -log_likelihood
+	nnll = nll / n 
+
+	print(f'{nnll=}')
+
+	# Loss = normalized negative log likelihood
+	# Maximize likelihood = maximize log likelihood = minimize nll = minimize nnll = minimize loss
+	return nnll
+
+evaluate(words, 3)
+
+
