@@ -87,7 +87,7 @@ def get_itos(words):
 	return itos
 
 
-N = get_bigram_matrix(words)
+#N = get_bigram_matrix(words)
 
 def normalize_row(N, row):	
 	# N[0, :] or N[0] will give you the first row
@@ -195,6 +195,8 @@ def evaluate(words, num_words):
 	# Loss = normalized negative log likelihood
 	# Maximize likelihood = maximize log likelihood = minimize nll = minimize nnll = minimize loss
 	return nnll
+
+
 
 evaluate(words, 3)
 
