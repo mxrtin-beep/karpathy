@@ -82,24 +82,24 @@ def get_probs(words, n_words, W):
 	return probs
 
 
-def evaluate(words, n_words_train, n_words_eval, n_epochs, verbose = False):
+def evaluate(words, n_words, n_epochs, verbose = False):
 
 	g = torch.Generator().manual_seed(2147483647)
 	W = torch.randn((27, 27), generator=g, requires_grad=True)
 
-	xs, ys = get_training_set(words, n_words_train)
+	xs, ys = get_training_set(words, n_words)
 	print(xs)
 
-	nlls = torch.zeros(n_words_eval)
+	nlls = torch.zeros(n_words)
 
 	itos = get_itos(words)
 
 	for i in range(n_epochs):
 		# Making predictions
-		probs = get_probs(words, n_words_train, W) # y_pred
+		probs = get_probs(words, n_words, W) # y_pred
 
 		# Getting the loss
-		for i in range(n_words_eval):
+		for i in range(n_words):
 
 			# i-th bigram
 			x = xs[i].item() 	# input char index
@@ -128,7 +128,7 @@ def evaluate(words, n_words_train, n_words_eval, n_epochs, verbose = False):
 		print('average nll, loss =', nlls.mean().item())
 
 		# Probabilities of next character
-		ps_next_char = probs[torch.arange(n_words_eval), ys]
+		ps_next_char = probs[torch.arange(n_words), ys]
 		loss = -ps_next_char.log().mean()
 
 		#return loss
@@ -140,7 +140,7 @@ def evaluate(words, n_words_train, n_words_eval, n_epochs, verbose = False):
 
 		W.data += -50 * W.grad
 
-nlls = evaluate(words, 228146, 228146, 50)
+#nlls = evaluate(words, 228146, 228146, 50)
 
 # Probs is our y_pred
 # evaluating it based on nll instead of mse as the loss
@@ -152,5 +152,80 @@ nlls = evaluate(words, 228146, 228146, 50)
 
 
 
+# ------------------------------------------------------------------------------------------------
+
+def forward(xs, ys, W, num, regularize, return_p = False):
+
+	reg_loss = 0.01
+
+	xenc = F.one_hot(xs, num_classes=27).float()
+	logits = xenc @ W
+	counts = logits.exp()
+	probs = counts / counts.sum(1, keepdims=True)
+	loss = -probs[torch.arange(num), ys].log().mean()
+
+	# Tries to make weights go to zero.
+	if regularize:
+		loss += reg_loss * (W**2).mean()
 
 
+	if return_p: return probs
+
+	return loss
+
+def backward(W, loss, learning_rate = 0.1):
+	W.grad = None
+	loss.backward()
+
+	W.data += -1 * learning_rate * W.grad
+
+	return W
+
+
+def short_evaluate(words, n_epochs, n_examples, regularize = False):
+	g = torch.Generator().manual_seed(2147483647)
+	W = torch.randn((27, 27), generator=g, requires_grad=True)
+
+	xs, ys = get_training_set(words, n_examples)
+
+	for i in range(n_epochs):
+
+		loss = forward(xs, ys, W, n_examples, regularize)
+
+		print('Loss: ', loss.item())
+
+		W = backward(W, loss, 50)
+
+	return W
+
+#short_evaluate(words, 100, 228146, regularize=True)
+
+
+
+def sample(words, W):
+
+	g = torch.Generator().manual_seed(2147483647+1)
+	itos = get_itos(words)
+
+	for i in range(5):
+		out = []
+		ix = 0
+
+		while True:
+			xenc = F.one_hot(torch.tensor([ix]), num_classes=27).float()
+			logits = xenc @ W # Plucks out row of W corresponding to ix
+
+			counts = logits.exp()
+			probs = counts / counts.sum(1, keepdims=True)
+
+			ix = torch.multinomial(probs, num_samples=1, replacement=True, generator=g).item()
+			out.append(itos[ix])
+
+			if ix==0:
+				break
+		print(''.join(out))
+
+W = short_evaluate(words, 10, 228146, regularize=True)
+
+
+sample(words, W)
