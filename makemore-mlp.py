@@ -149,6 +149,10 @@ loss = F.cross_entropy(logits, Y)
 parameters = [C, W1, b1, W2, b2]
 
 
+def normalize(ten):
+
+	return (ten - ten.mean(0, keepdim=True)) / ten.std(0, keepdim=True)
+
 def get_split_data(words):
 
 	random.seed(42)
@@ -162,29 +166,49 @@ def get_split_data(words):
 
 	return X_tr, Y_tr, X_dev, Y_dev, X_te, Y_te
 
-X_tr, Y_tr, X_dev, Y_dev, X_te, Y_te = get_split_data(words)
 
 def get_parameters(g, block_size, n_inputs, n_features, hidden_layer_nodes):
-	C = torch.randn((n_inputs, n_features), generator=g) 
+	gain = (5/3)
 
-	W1 = torch.randn((n_features*block_size, hidden_layer_nodes), generator=g)
-	b1 = torch.randn(hidden_layer_nodes, generator=g)
 
-	W2 = torch.randn((hidden_layer_nodes, n_inputs), generator=g)
-	b2 = torch.randn(n_inputs, generator=g)
+	C = torch.randn((n_inputs, n_features),							 	generator=g) 
 
-	return [C, W1, b1, W2, b2]
+	# Squash W1 and b1 to void killing neurons and saturated tanh.
+	W1 = torch.randn((n_features*block_size, hidden_layer_nodes), 		generator=g) * gain / ((n_features*block_size))**0.5
+	b1 = torch.randn(hidden_layer_nodes, 								generator=g) * 0.01
 
-parameters = get_parameters(g, block_size=3, n_inputs=27, n_features=10, hidden_layer_nodes=100)
+	# Normally have wildly wrong weights --> squash them down to be closer to all  the same.
+	# Can fix having extremely high loss on first iteration.
+	W2 = torch.randn((hidden_layer_nodes, n_inputs), 					generator=g) * 0.01
+	b2 = torch.randn(n_inputs, 											generator=g) * 0
+
+	bngain = torch.ones((1, hidden_layer_nodes))
+	bnbias = torch.zeros((1, hidden_layer_nodes))
+
+
+	return [C, W1, b1, W2, b2, bngain, bnbias]
+
 
 def forward(X, Y, parameters):
 
-	C, W1, b1, W2, b2 = [parameters[i] for i in range(len(parameters))]
+	C, W1, b1, W2, b2, bngain, bnbias = [parameters[i] for i in range(len(parameters))]
 
-	emb = C[X] # (32, 3, 2)
-	h = torch.tanh(emb.view(-1, 30) @ W1 + b1) # (32, 100)
-	logits = h @ W2 + b2 # (32, 27)
-	loss = F.cross_entropy(logits, Y)
+	emb = C[X] # (32, 3, 2); embed the characters into vectors
+	embcat = emb.view(emb.shape[0], 30)	# concatenate the vectors
+
+	# A lot of hs are 1 or -1, which makes out.grad 0 because out.grad is a factor of (1 - t^2).
+	# 'Saturated tanh' problem.
+	# Can have a dead neuron when, for every example, the tanh is saturated.
+	# Can happen with a large learning rate or initialization.
+	# hpreact is a normal distribution that is too wide.
+	# Can solve by squashing W1 and b1.
+	hpreact = embcat @ W1 + b1				# hidden layer preactivation
+	#hpreact = normalize(hpreact)			# batch normalize
+	hpreact = hpreact * bngain + bnbias		# scale and shift
+
+	h = torch.tanh(hpreact) # (32, 100); hidden layer
+	logits = h @ W2 + b2 # (32, 27); output layer
+	loss = F.cross_entropy(logits, Y) 
 
 	return loss
 
@@ -205,11 +229,11 @@ def evaluate(X, Y, parameters, n_epochs, batch_size, learning_rate=0.1, dynamic_
 	for p in parameters:
 		p.requires_grad = True
 
-	C, W1, b1, W2, b2 = [parameters[i] for i in range(len(parameters))]
+	C, W1, b1, W2, b2, bngain, bnbias = [parameters[i] for i in range(len(parameters))]
 
 	for i in range(n_epochs):
 
-		if i > (n_epochs / 2):
+		if dynamic_lr and i > (n_epochs / 10):
 			learning_rate = 0.01
 
 		ix = torch.randint(0, X.shape[0], (32,))
@@ -219,17 +243,17 @@ def evaluate(X, Y, parameters, n_epochs, batch_size, learning_rate=0.1, dynamic_
 	
 		parameters = backward(loss, parameters, learning_rate)
 
+		if i % (n_epochs / 10) == 0:
+			print(f'{i:7d}/{n_epochs:7d}: {loss.item():.4f}')
+
+		
 	return parameters
 
 
 # Can easily overfit to 32 examples.
 # Can't get 0 loss because cannot predict the first letter
 # 100% correctly.
-parameters = evaluate(X_tr, Y_tr, parameters, n_epochs=5000, batch_size=32, learning_rate=0.1, dynamic_lr=False)
 
-loss = forward(X_dev, Y_dev, parameters)
-
-print("Dev Loss: ", loss.item())
 # Too slow to forward and backward for thousands of words each time.
 # Use Batching.
 # 	The quality of the gradient goes down, but it's much faster.
@@ -241,12 +265,23 @@ def sample(n_samples, block_size, parameters):
 		out = []
 		context = [0]*block_size
 		itos = get_itos(words)
-		C, W1, b1, W2, b2 = [parameters[i] for i in range(len(parameters))]
+		C, W1, b1, W2, b2, bngain, bnbias = [parameters[i] for i in range(len(parameters))]
 
 		while True:
 
 			emb = C[torch.tensor([context])]
-			h = torch.tanh(emb.view(1, -1) @ W1 + b1)
+			embcat = emb.view(1, -1)
+
+			hpreact = embcat @ W1 + b1					# hidden layer preactivation
+
+			#hpreact = bngain * (hpreact - hpreact.mean(0, keepdim=True)) / 1 + bnbias
+			#hpreact = normalize(hpreact)			# batch normalize
+			#print(hpreact)
+			#hpreact = hpreact * bngain + bnbias		# scale and shift
+
+			#h = torch.tanh(hpreact) # (32, 100); hidden layer
+
+			h = torch.tanh(hpreact)
 			logits = h @ W2 + b2 
 			probs = F.softmax(logits, dim=1)
 			ix = torch.multinomial(probs, num_samples=1, generator=g).item()
@@ -258,6 +293,45 @@ def sample(n_samples, block_size, parameters):
 
 		print(''.join(itos[i] for i in out))
 
-sample(10, 3, parameters)
+
+# Another problem
+# When you calculate y = x @ w, where x and w are Gaussian distributions,
+# the stdev of y increases, which we don't want.
+# Solution: divide y by n^0.5, where n is the number of input elements.
+# Ex. x (1000, 10) @ w (10, 200) = y / 10^0.5.
+# Use torch.nn.kaiming_normal_(tensor, a=0, mode='fan_in', nonlinearity='leaky_relu')
+#	fan_in refers to whether or not to normalize activations or gradients (doesn't really matteR)
+#	std = gain / sqrt(fan_mode)
+#	nonlinearity affects gain (tanh: 5/3; linear or sigmoid: 1; relu: sqrt(2))
+# 	gain is important for squashing functions to offset squashing and bring
+#	stdev UP to 1.
+
+# Makemore part 3
+# Solving Problems
+# 	Loss extremely high upon initialization --> scale down W2 and b2
+# 	Saturated tanh / dead neurons --> scale down W1 and b1
+# 	Not normalized --> kaiming normalization of weights by 5/3 / sqrt(fan_in)
+# 	Batch Normalization --> normalize hidden layer activations to be Gaussian + scale and shift
 
 
+def main():
+
+	words = open('names.txt', 'r').read().splitlines()
+
+	g = torch.Generator().manual_seed(2147483647)
+
+	N_WORDS = len(words)
+
+	parameters = get_parameters(g, block_size=3, n_inputs=27, n_features=10, hidden_layer_nodes=100)
+
+	X_tr, Y_tr, X_dev, Y_dev, X_te, Y_te = get_split_data(words)
+
+	parameters = evaluate(X_tr, Y_tr, parameters, n_epochs=5000, batch_size=32, learning_rate=0.1, dynamic_lr=False)
+
+	loss = forward(X_dev, Y_dev, parameters)
+
+	print("Dev Loss: ", loss.item())
+
+	sample(10, 3, parameters)
+
+main()
