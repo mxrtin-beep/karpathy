@@ -149,7 +149,7 @@ loss = F.cross_entropy(logits, Y)
 parameters = [C, W1, b1, W2, b2]
 
 
-def normalize(ten):
+def normalize_tensor(ten):
 
 	return (ten - ten.mean(0, keepdim=True)) / ten.std(0, keepdim=True)
 
@@ -167,7 +167,7 @@ def get_split_data(words):
 	return X_tr, Y_tr, X_dev, Y_dev, X_te, Y_te
 
 
-def get_parameters(g, block_size, n_inputs, n_features, hidden_layer_nodes):
+def get_parameters(g, block_size, n_inputs, n_features, hidden_layer_nodes, normalize=False):
 	gain = (5/3)
 
 
@@ -185,13 +185,18 @@ def get_parameters(g, block_size, n_inputs, n_features, hidden_layer_nodes):
 	bngain = torch.ones((1, hidden_layer_nodes))
 	bnbias = torch.zeros((1, hidden_layer_nodes))
 
+	if normalize:
+		return [C, W1, b1, W2, b2, bngain, bnbias]
 
 	return [C, W1, b1, W2, b2]
 
 
-def forward(X, Y, parameters):
+def forward(X, parameters, normalize=False):
 
-	C, W1, b1, W2, b2 = [parameters[i] for i in range(len(parameters))]
+	if normalize:
+		C, W1, b1, W2, b2, bngain, bnbias = [parameters[i] for i in range(len(parameters))]
+	else:
+		C, W1, b1, W2, b2 = [parameters[i] for i in range(len(parameters))]
 
 	emb = C[X] # (32, 3, 2); embed the characters into vectors
 	embcat = emb.view(emb.shape[0], 30)	# concatenate the vectors
@@ -203,14 +208,19 @@ def forward(X, Y, parameters):
 	# hpreact is a normal distribution that is too wide.
 	# Can solve by squashing W1 and b1.
 	hpreact = embcat @ W1 + b1				# hidden layer preactivation
-	#hpreact = normalize(hpreact)			# batch normalize
-	#hpreact = hpreact * bngain + bnbias		# scale and shift
+
+	if normalize:
+		hpreact = normalize_tensor(hpreact)			# batch normalize
+		hpreact = hpreact * bngain + bnbias		# scale and shift
 
 	h = torch.tanh(hpreact) # (32, 100); hidden layer
 	logits = h @ W2 + b2 # (32, 27); output layer
-	loss = F.cross_entropy(logits, Y) 
 
-	return loss
+	return logits
+
+def get_loss(logits, Y):
+	return F.cross_entropy(logits, Y)
+
 
 def backward(loss, parameters, learning_rate = 0.01):
 
@@ -224,12 +234,16 @@ def backward(loss, parameters, learning_rate = 0.01):
 	return parameters
 
 
-def evaluate(X, Y, parameters, n_epochs, batch_size, learning_rate=0.1, dynamic_lr = False):
+def evaluate(X, Y, parameters, n_epochs, batch_size, learning_rate=0.1, dynamic_lr = False, normalize=False):
 
 	for p in parameters:
 		p.requires_grad = True
 
-	C, W1, b1, W2, b2 = [parameters[i] for i in range(len(parameters))]
+	if normalize:
+		C, W1, b1, W2, b2, bngain, bnbias = [parameters[i] for i in range(len(parameters))]
+	else:
+		C, W1, b1, W2, b2 = [parameters[i] for i in range(len(parameters))]
+
 
 	for i in range(n_epochs):
 
@@ -238,7 +252,8 @@ def evaluate(X, Y, parameters, n_epochs, batch_size, learning_rate=0.1, dynamic_
 
 		ix = torch.randint(0, X.shape[0], (32,))
 
-		loss = forward(X[ix], Y[ix], parameters)
+		logits = forward(X[ix], parameters, normalize=normalize)
+		loss = get_loss(logits, Y[ix])
 		#print(loss.item())
 	
 		parameters = backward(loss, parameters, learning_rate)
@@ -259,30 +274,16 @@ def evaluate(X, Y, parameters, n_epochs, batch_size, learning_rate=0.1, dynamic_
 # 	The quality of the gradient goes down, but it's much faster.
 # 	Better to have a worse gradient and iterate 10x more.
 
-def sample(n_samples, block_size, parameters):
+def sample(n_samples, block_size, parameters, normalize=False):
 
 	for i in range(n_samples):
 		out = []
 		context = [0]*block_size
 		itos = get_itos(words)
-		C, W1, b1, W2, b2 = [parameters[i] for i in range(len(parameters))]
 
 		while True:
 
-			emb = C[torch.tensor([context])]
-			embcat = emb.view(1, -1)
-
-			hpreact = embcat @ W1 + b1					# hidden layer preactivation
-
-			#hpreact = bngain * (hpreact - hpreact.mean(0, keepdim=True)) / 1 + bnbias
-			#hpreact = normalize(hpreact)			# batch normalize
-			#print(hpreact)
-			#hpreact = hpreact * bngain + bnbias		# scale and shift
-
-			#h = torch.tanh(hpreact) # (32, 100); hidden layer
-
-			h = torch.tanh(hpreact)
-			logits = h @ W2 + b2 
+			logits = forward(torch.tensor([context]), parameters, normalize=normalize) 
 			probs = F.softmax(logits, dim=1)
 			ix = torch.multinomial(probs, num_samples=1, generator=g).item()
 			context = context[1:] + [ix]
@@ -322,16 +323,27 @@ def main():
 
 	N_WORDS = len(words)
 
-	parameters = get_parameters(g, block_size=3, n_inputs=27, n_features=10, hidden_layer_nodes=100)
+	NORMALIZE = False
+
+	parameters = get_parameters(g, block_size=3, n_inputs=27, n_features=10, hidden_layer_nodes=100, normalize=NORMALIZE)
 
 	X_tr, Y_tr, X_dev, Y_dev, X_te, Y_te = get_split_data(words)
 
-	parameters = evaluate(X_tr, Y_tr, parameters, n_epochs=10000, batch_size=32, learning_rate=0.1, dynamic_lr=False)
+	parameters = evaluate(X_tr, Y_tr, parameters, n_epochs=10000, batch_size=32, learning_rate=0.1, dynamic_lr=False, normalize=NORMALIZE)
 
-	loss = forward(X_dev, Y_dev, parameters)
+	logits = forward(X_dev, parameters, normalize=NORMALIZE)
+	loss = get_loss(logits, Y_dev)
 
 	print("Dev Loss: ", loss.item())
 
-	sample(10, 3, parameters)
+	sample(10, 3, parameters, normalize=NORMALIZE)
 
 main()
+clown = torch.tensor([[-1.263600,  0.32630, -0.91806]])
+print(clown)
+std = clown[0].std(0, keepdim=True)
+
+print(clown/std)
+
+
+
