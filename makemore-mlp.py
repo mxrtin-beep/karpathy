@@ -20,7 +20,7 @@ import random
 
 words = open('names.txt', 'r').read().splitlines()
 
-g = torch.Generator().manual_seed(2147483647)
+g = torch.Generator().manual_seed(2147483647+2)
 
 N_WORDS = len(words)
 
@@ -186,12 +186,12 @@ def get_parameters(g, block_size, n_inputs, n_features, hidden_layer_nodes):
 	bnbias = torch.zeros((1, hidden_layer_nodes))
 
 
-	return [C, W1, b1, W2, b2, bngain, bnbias]
+	return [C, W1, b1, W2, b2]
 
 
 def forward(X, Y, parameters):
 
-	C, W1, b1, W2, b2, bngain, bnbias = [parameters[i] for i in range(len(parameters))]
+	C, W1, b1, W2, b2 = [parameters[i] for i in range(len(parameters))]
 
 	emb = C[X] # (32, 3, 2); embed the characters into vectors
 	embcat = emb.view(emb.shape[0], 30)	# concatenate the vectors
@@ -204,7 +204,7 @@ def forward(X, Y, parameters):
 	# Can solve by squashing W1 and b1.
 	hpreact = embcat @ W1 + b1				# hidden layer preactivation
 	#hpreact = normalize(hpreact)			# batch normalize
-	hpreact = hpreact * bngain + bnbias		# scale and shift
+	#hpreact = hpreact * bngain + bnbias		# scale and shift
 
 	h = torch.tanh(hpreact) # (32, 100); hidden layer
 	logits = h @ W2 + b2 # (32, 27); output layer
@@ -229,7 +229,7 @@ def evaluate(X, Y, parameters, n_epochs, batch_size, learning_rate=0.1, dynamic_
 	for p in parameters:
 		p.requires_grad = True
 
-	C, W1, b1, W2, b2, bngain, bnbias = [parameters[i] for i in range(len(parameters))]
+	C, W1, b1, W2, b2 = [parameters[i] for i in range(len(parameters))]
 
 	for i in range(n_epochs):
 
@@ -265,7 +265,7 @@ def sample(n_samples, block_size, parameters):
 		out = []
 		context = [0]*block_size
 		itos = get_itos(words)
-		C, W1, b1, W2, b2, bngain, bnbias = [parameters[i] for i in range(len(parameters))]
+		C, W1, b1, W2, b2 = [parameters[i] for i in range(len(parameters))]
 
 		while True:
 
@@ -326,7 +326,7 @@ def main():
 
 	X_tr, Y_tr, X_dev, Y_dev, X_te, Y_te = get_split_data(words)
 
-	parameters = evaluate(X_tr, Y_tr, parameters, n_epochs=5000, batch_size=32, learning_rate=0.1, dynamic_lr=False)
+	parameters = evaluate(X_tr, Y_tr, parameters, n_epochs=10000, batch_size=32, learning_rate=0.1, dynamic_lr=False)
 
 	loss = forward(X_dev, Y_dev, parameters)
 
