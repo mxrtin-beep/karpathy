@@ -20,7 +20,7 @@ import random
 
 words = open('names.txt', 'r').read().splitlines()
 
-g = torch.Generator().manual_seed(2147483647+2)
+g = torch.Generator().manual_seed(2147483647)
 
 N_WORDS = len(words)
 
@@ -151,7 +151,12 @@ parameters = [C, W1, b1, W2, b2]
 
 def normalize_tensor(ten):
 
-	return (ten - ten.mean(0, keepdim=True)) / ten.std(0, keepdim=True)
+	std = ten.std(0, keepdim=True)
+	if (std[0, 0].item() != std[0, 0].item()): # if nan
+		#print('nan')
+		std = 1
+
+	return (ten - ten.mean(0, keepdim=True)) / std
 
 def get_split_data(words):
 
@@ -274,7 +279,7 @@ def evaluate(X, Y, parameters, n_epochs, batch_size, learning_rate=0.1, dynamic_
 # 	The quality of the gradient goes down, but it's much faster.
 # 	Better to have a worse gradient and iterate 10x more.
 
-def sample(n_samples, block_size, parameters, normalize=False):
+def sample(n_samples, block_size, parameters, normalize=False, seeded=False):
 
 	for i in range(n_samples):
 		out = []
@@ -283,15 +288,20 @@ def sample(n_samples, block_size, parameters, normalize=False):
 
 		while True:
 
+			X = torch.tensor([context])
+
 			logits = forward(torch.tensor([context]), parameters, normalize=normalize) 
 			probs = F.softmax(logits, dim=1)
-			ix = torch.multinomial(probs, num_samples=1, generator=g).item()
+			#print(probs)
+			if seeded:
+				ix = torch.multinomial(probs, num_samples=1, generator=g).item()
+			else:
+				ix = torch.multinomial(probs, num_samples=1).item()
 			context = context[1:] + [ix]
 			out.append(ix)
 
 			if ix==0:
 				break
-
 		print(''.join(itos[i] for i in out))
 
 
@@ -319,7 +329,11 @@ def main():
 
 	words = open('names.txt', 'r').read().splitlines()
 
-	g = torch.Generator().manual_seed(2147483647)
+	#g = torch.Generator().manual_seed(2147483647)
+	seed = 21474836471
+	#seed = torch.seed()
+	print(seed)
+	g = torch.Generator().manual_seed(seed)
 
 	N_WORDS = len(words)
 
@@ -329,21 +343,23 @@ def main():
 
 	X_tr, Y_tr, X_dev, Y_dev, X_te, Y_te = get_split_data(words)
 
-	parameters = evaluate(X_tr, Y_tr, parameters, n_epochs=10000, batch_size=32, learning_rate=0.1, dynamic_lr=False, normalize=NORMALIZE)
+	parameters = evaluate(X_tr, Y_tr, parameters, n_epochs=10000, batch_size=50, learning_rate=0.1, dynamic_lr=False, normalize=NORMALIZE)
 
 	logits = forward(X_dev, parameters, normalize=NORMALIZE)
 	loss = get_loss(logits, Y_dev)
 
 	print("Dev Loss: ", loss.item())
 
-	sample(10, 3, parameters, normalize=NORMALIZE)
+	sample(10, 3, parameters, normalize=NORMALIZE, seeded=False)
 
 main()
+
+'''
 clown = torch.tensor([[-1.263600,  0.32630, -0.91806]])
 print(clown)
-std = clown[0].std(0, keepdim=True)
-
-print(clown/std)
-
+std = clown.std(0, keepdim=True)
+print(std)
+print(std[0, 0].item() != std[0, 0].item())
+'''
 
 
