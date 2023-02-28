@@ -64,92 +64,10 @@ def build_dataset(words, block_size, n_words):
 
 	return X, Y
 
-X, Y = build_dataset(words, 3, N_WORDS)
-# X: 32x3
-#	32 examples
-#	Each input is 3 integers
-# Y: 32x1
-#	32 examples
-#	Each output is 1 integer (label)
 
+def normalize_tensor(ten, mean, std):
 
-# Lookup table
-
-C = torch.randn((27, 2), generator=g) 	# embedding into 2 dimensions
-
-#val = F.one_hot(torch.tensor(5), num_classes=27).float() @ C
-# 1x27 @ 27x2 = 1x2
-# Equivalent to lookup table as well as layer in a NN, where C is the weights matrix.
-
-# Can index tensors with tensors
-# Returns a 32x3x2 tensor
-# The 32x3 is the X matrix, and for each value there are 2 features from C. 
-emb = C[X]
-
-# For example, X[13, 2] == 1. C[X][13, 2] == (a, b). C[1] == (a, b).
-
-# --------------------------------- Hidden Layer ---------------------------------
-
-# 6 features (2 features per char x 3 chars) to 100 nodes.
-W1 = torch.randn((6, 100), generator=g)
-b1 = torch.randn(100, generator=g)
-
-# Cannot do emb @ W1 + b1, because different indices.
-
-#word1 = emb[:, 0, :] 	# Plucks out all examples, 0th index, all features.
-						# 32x2 matrix.
-
-
-# These all do the same thing:
-#clown = torch.cat([emb[:, 0, :], emb[:, 1, :], emb[:, 2, :]], dim = 1)
-#clown2 = torch.cat(torch.unbind(emb, 1), 1)
-# Concatenates all couples of features of each letter together.
-# 32x6
-
-# Can also do tensor.view(a, b, c)
-# As long as a, b, and c multiply to length of tensor, it works.
-# VERY efficient, doesn't change storage or memory of tensor.
-
-# -1 infers the size to be 32 so it multiplies to 192.
-h = torch.tanh(emb.view(-1, 6) @ W1 + b1) # (-1, 1)
-
-# 32x6 @ 6x100 = 32x100
-# 100-dimensional activation for 32 examples.
-
-# --------------------------------- Output Layer ---------------------------------
-
-# 100 nodes to 27 logits
-W2 = torch.randn((100, 27), generator=g)
-b2 = torch.randn(27, generator=g)
-
-logits = h @ W2 + b2
-# Shape is 32x27
-
-counts = logits.exp()
-prob = counts / counts.sum(1, keepdims=True)
-# Every row sums to 1.
-
-# --------------------------------- Labels ---------------------------------
-
-
-# For each row of prob (0 to 31), index the Y column.
-# Probability of the next letter occuring.
-# Ideally should all be 1.
-#prob[torch.arange(32), Y] # Probability of each char being next.
-
-#loss = -prob[torch.arange(32), Y].log().mean()
-
-# Can just use tensorflow function to do the last three lines.
-# Much more time and space efficient.
-# Also avoids logits.exp() going to infinity for big numbers.
-#	Since you can add any number to all the logits and it will preserve the answer,
-# 	Tensorflow calculates the max and subtracts it.
-loss = F.cross_entropy(logits, Y)
-
-parameters = [C, W1, b1, W2, b2]
-
-
-
+	return (ten - mean) / std
 
 def get_split_data(words):
 
@@ -180,30 +98,50 @@ def get_parameters(g, block_size, n_inputs, n_features, hidden_layer_nodes):
 	W2 = torch.randn((hidden_layer_nodes, n_inputs), 					generator=g) * 0.01
 	b2 = torch.randn(n_inputs, 											generator=g) * 0
 
-	return [C, W1, b1, W2, b2]
+	bngain = torch.ones((1, hidden_layer_nodes))
+	bnbias = torch.zeros((1, hidden_layer_nodes))
 
 
-def forward(X, parameters):
+	return [C, W1, W2, b2, bngain, bnbias]
 
+def forward_normalize(X, parameters, mean, std):
+	C, W1, W2, b2, bngain, bnbias = [parameters[i] for i in range(len(parameters))]
 
-	C, W1, b1, W2, b2 = [parameters[i] for i in range(len(parameters))]
+	emb = C[X]
+	embcat = emb.view(emb.shape[0], -1)
+
+	# Biases are useless when doing batch norm on the same layer.
+	# They will get extracted out by mean and bnbias.
+	hpreact = embcat @ W1 # + b1
+
+	hpreact = bngain * (hpreact - mean) / std + bnbias
+	h = torch.tanh(hpreact)
+
+	logits = h @ W2 + b2
+
+	return logits
+
+def forward_bn(X, parameters, bnmean_running, bnstd_running):
+	C, W1, W2, b2, bngain, bnbias = [parameters[i] for i in range(len(parameters))]
 
 	emb = C[X] # (32, 3, 2); embed the characters into vectors
-	embcat = emb.view(emb.shape[0], 30)	# concatenate the vectors
+	embcat = emb.view(emb.shape[0], -1)	# concatenate the vectors
+	hpreact = embcat @ W1 # + b1				# hidden layer preactivation
 
-	# A lot of hs are 1 or -1, which makes out.grad 0 because out.grad is a factor of (1 - t^2).
-	# 'Saturated tanh' problem.
-	# Can have a dead neuron when, for every example, the tanh is saturated.
-	# Can happen with a large learning rate or initialization.
-	# hpreact is a normal distribution that is too wide.
-	# Can solve by squashing W1 and b1.
-	hpreact = embcat @ W1 + b1				# hidden layer preactivation
+	bnmeani = hpreact.mean(0, keepdim=True)
+	bnstdi = hpreact.std(0, keepdim=True)
+	hpreact = normalize_tensor(hpreact, bnmeani, bnstdi)			# batch normalize
+	hpreact = hpreact * bngain + bnbias		# scale and shift
 
-		
+	with torch.no_grad():
+		bnmean_running = 0.999 * bnmean_running + 0.001 * bnmeani
+		bnstd_running = 0.999 * bnstd_running + 0.001 * bnstdi
+
+
 	h = torch.tanh(hpreact) # (32, 100); hidden layer
 	logits = h @ W2 + b2 # (32, 27); output layer
 
-	return logits
+	return logits, bnmean_running, bnstd_running
 
 def get_loss(logits, Y):
 	return F.cross_entropy(logits, Y)
@@ -221,13 +159,14 @@ def backward(loss, parameters, learning_rate = 0.01):
 	return parameters
 
 
-def evaluate(X, Y, parameters, n_epochs, batch_size, learning_rate=0.1, dynamic_lr = False):
+def evaluate(X, Y, parameters, bnmean_running, bnstd_running, n_epochs, batch_size, learning_rate=0.1, dynamic_lr = False):
 
 	for p in parameters:
 		p.requires_grad = True
 
 	
-	C, W1, b1, W2, b2 = [parameters[i] for i in range(len(parameters))]
+	C, W1, W2, b2, bngain, bnbias = [parameters[i] for i in range(len(parameters))]
+	
 
 
 	for i in range(n_epochs):
@@ -237,7 +176,7 @@ def evaluate(X, Y, parameters, n_epochs, batch_size, learning_rate=0.1, dynamic_
 
 		ix = torch.randint(0, X.shape[0], (32,))
 
-		logits = forward(X[ix], parameters)
+		logits, bnmean_running, bnstd_running = forward_bn(X[ix], parameters, bnmean_running, bnstd_running)
 		loss = get_loss(logits, Y[ix])
 		#print(loss.item())
 	
@@ -247,7 +186,26 @@ def evaluate(X, Y, parameters, n_epochs, batch_size, learning_rate=0.1, dynamic_
 			print(f'{i:7d}/{n_epochs:7d}: {loss.item():.4f}')
 
 		
-	return parameters
+	return parameters, bnmean_running, bnstd_running
+
+
+# X should be Xtr
+# Should only be called if normalize is true.
+def get_whole_means(X, parameters):
+
+	C, W1, W2, b2, bngain, bnbias = [parameters[i] for i in range(len(parameters))]
+
+	with torch.no_grad():
+		# Pass training set through
+		emb = C[X]
+		embcat = emb.view(emb.shape[0], -1)
+		hpreact = embcat @ W1 # + b1
+
+		# measure mean and stdev over whole training set
+		bnmean = hpreact.mean(0, keepdim=True)
+		bnstd = hpreact.std(0, keepdim=True)
+
+		return bnmean, bnstd
 
 # Can easily overfit to 32 examples.
 # Can't get 0 loss because cannot predict the first letter
@@ -270,8 +228,8 @@ def sample(n_samples, block_size, parameters, seeded=False, mean=0, std=0):
 
 			X = torch.tensor([context])
 
-		
-			logits = forward(torch.tensor([context]), parameters) 
+			logits = forward_normalize(torch.tensor([context]), parameters, mean, std)
+
 			probs = F.softmax(logits, dim=1)
 			#print(probs)
 			if seeded:
@@ -322,17 +280,33 @@ def main():
 
 	X_tr, Y_tr, X_dev, Y_dev, X_te, Y_te = get_split_data(words)
 
-	parameters = evaluate(X_tr, Y_tr, parameters, n_epochs=10000, batch_size=50, learning_rate=0.1, dynamic_lr=False)
+	bnmean_running = torch.zeros((1, 100))
+	bnstd_running = torch.ones((1, 100))
 
+	parameters, bnmean_running, bnstd_running = evaluate(X_tr, Y_tr, parameters, bnmean_running, bnstd_running, n_epochs=10000, batch_size=50, learning_rate=0.1, dynamic_lr=False)
 
-	logits = forward(X_dev, parameters)
+	#bnmean, bnstd = get_whole_means(X_tr, parameters)
+	
+	logits = forward_normalize(X_dev, parameters, bnmean_running, bnstd_running)
 	loss = get_loss(logits, Y_dev)
+	
 
 	print("Dev Loss: ", loss.item())
 
-	
-	sample(10, 3, parameters, seeded=False)
 
+
+
+	sample(10, 3, parameters, seeded=False, mean=bnmean_running, std=bnstd_running)
+
+	
 main()
+
+'''
+clown = torch.tensor([[-1.263600,  0.32630, -0.91806]])
+print(clown)
+std = clown.std(0, keepdim=True)
+print(std)
+print(std[0, 0].item() != std[0, 0].item())
+'''
 
 
