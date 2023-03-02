@@ -102,17 +102,17 @@ def get_parameters(g, block_size, n_inputs, n_features, hidden_layer_nodes):
 	bnbias = torch.zeros((1, hidden_layer_nodes))
 
 
-	return [C, W1, W2, b2, bngain, bnbias]
+	return [C, W1, b1, W2, b2, bngain, bnbias]
 
 def forward_normalize(X, parameters, mean, std):
-	C, W1, W2, b2, bngain, bnbias = [parameters[i] for i in range(len(parameters))]
+	C, W1, b1, W2, b2, bngain, bnbias = [parameters[i] for i in range(len(parameters))]
 
 	emb = C[X]
 	embcat = emb.view(emb.shape[0], -1)
 
 	# Biases are useless when doing batch norm on the same layer.
 	# They will get extracted out by mean and bnbias.
-	hpreact = embcat @ W1 # + b1
+	hpreact = embcat @ W1 + b1
 
 	hpreact = bngain * (hpreact - mean) / std + bnbias
 	h = torch.tanh(hpreact)
@@ -122,11 +122,11 @@ def forward_normalize(X, parameters, mean, std):
 	return logits
 
 def forward_bn(X, parameters, bnmean_running, bnstd_running):
-	C, W1, W2, b2, bngain, bnbias = [parameters[i] for i in range(len(parameters))]
+	C, W1, b1, W2, b2, bngain, bnbias = [parameters[i] for i in range(len(parameters))]
 
 	emb = C[X] # (32, 3, 2); embed the characters into vectors
 	embcat = emb.view(emb.shape[0], -1)	# concatenate the vectors
-	hpreact = embcat @ W1 # + b1				# hidden layer preactivation
+	hpreact = embcat @ W1 + b1				# hidden layer preactivation
 
 	bnmeani = hpreact.mean(0, keepdim=True)
 	bnstdi = hpreact.std(0, keepdim=True)
@@ -165,7 +165,7 @@ def evaluate(X, Y, parameters, bnmean_running, bnstd_running, n_epochs, batch_si
 		p.requires_grad = True
 
 	
-	C, W1, W2, b2, bngain, bnbias = [parameters[i] for i in range(len(parameters))]
+	C, W1, b1, W2, b2, bngain, bnbias = [parameters[i] for i in range(len(parameters))]
 	
 
 
@@ -193,13 +193,13 @@ def evaluate(X, Y, parameters, bnmean_running, bnstd_running, n_epochs, batch_si
 # Should only be called if normalize is true.
 def get_whole_means(X, parameters):
 
-	C, W1, W2, b2, bngain, bnbias = [parameters[i] for i in range(len(parameters))]
+	C, W1, b1, W2, b2, bngain, bnbias = [parameters[i] for i in range(len(parameters))]
 
 	with torch.no_grad():
 		# Pass training set through
 		emb = C[X]
 		embcat = emb.view(emb.shape[0], -1)
-		hpreact = embcat @ W1 # + b1
+		hpreact = embcat @ W1 + b1
 
 		# measure mean and stdev over whole training set
 		bnmean = hpreact.mean(0, keepdim=True)
@@ -287,8 +287,8 @@ def main():
 
 	#bnmean, bnstd = get_whole_means(X_tr, parameters)
 	
-	logits = forward_normalize(X_dev, parameters, bnmean_running, bnstd_running)
-	loss = get_loss(logits, Y_dev)
+	logits = forward_normalize(X_te, parameters, bnmean_running, bnstd_running)
+	loss = get_loss(logits, Y_te)
 	
 
 	print("Dev Loss: ", loss.item())
@@ -298,7 +298,7 @@ def main():
 
 	sample(10, 3, parameters, seeded=False, mean=bnmean_running, std=bnstd_running)
 
-	
+
 main()
 
 '''
