@@ -60,6 +60,8 @@ def get_split_data(words):
 class Linear:
 
 	def __init__(self, fan_in, fan_out, bias=True):
+
+		# Squash W1 to void killing neurons and saturated tanh.
 		self.weight = torch.randn((fan_in, fan_out), generator=g) / fan_in**0.5
 		self.bias = torch.zeros(fan_out) if bias else None
 
@@ -135,17 +137,21 @@ def get_parameters(vocab_size = 27, block_size = 3, n_embd = 10, n_hidden = 100)
 	# If you don't have the Tanh layers, your activations will explode.
 	# Also, your whole network will be one linear function.
 	layers = [
-		Linear((n_embd * block_size), n_hidden), Tanh(),
-		Linear(				n_hidden, n_hidden), Tanh(),
-		Linear(				n_hidden, n_hidden), Tanh(),
-		Linear(				n_hidden, n_hidden), Tanh(),
-		Linear(				n_hidden, n_hidden), Tanh(),
-		Linear(				n_hidden, vocab_size),
+		Linear((n_embd * block_size), n_hidden, bias=False), BatchNorm1d(n_hidden), Tanh(),
+		Linear(				n_hidden, n_hidden, bias=False), BatchNorm1d(n_hidden), Tanh(),
+		Linear(				n_hidden, n_hidden, bias=False), BatchNorm1d(n_hidden), Tanh(),
+		Linear(				n_hidden, n_hidden, bias=False), BatchNorm1d(n_hidden), Tanh(),
+		Linear(				n_hidden, n_hidden, bias=False), BatchNorm1d(n_hidden), Tanh(),
+		Linear(				n_hidden, vocab_size, bias=False), BatchNorm1d(vocab_size), 
 	]
 
 	with torch.no_grad():
 		# Last layer: make it less confident
-		layers[-1].weight *= 0.1
+		if isinstance(layers[-1], Linear):
+			layers[-1].weight *= 0.1
+
+		elif isinstance(layers[-1], BatchNorm1d):
+			layers[-1].gamma *= 0.1
 
 		# All other layers: apply gain
 		for layer in layers[:-1]:
