@@ -160,6 +160,11 @@ def forward_bn(X, parameters, Y):
 	bndiff = hprebn - bnmeani
 	bndiff2 = bndiff**2
 
+	# Why divide by n-1 instead of n?
+	# n-1 is unbiased, n is biased
+	# n-1 is better for samples, which is the case for us because we use minibatches
+	# the paper uses a mismatch
+	# unfortunately, pytorch's batchnorm uses the biased version
 	bnvar = 1/(n-1)*(bndiff2).sum(0, keepdim=True)
 	bnvar_inv = (bnvar + 1e-5)**(-0.5)
 	bnraw = bndiff * bnvar_inv
@@ -193,13 +198,14 @@ def backward(loss, parameters, params, learning_rate = 0.01):
 
 	loss.backward()
 
+	# Commented this out because it fucked with backprop
 	#for p in parameters:
 	#	p.data += -1 * learning_rate * p.grad
 
 	return parameters, params
 
 
-def backprop(params, parameters, Y):
+def backprop(params, parameters, X, Y):
 
 	n = 32
 	logits, h, hpreact, bnraw, bnvar_inv, bnvar, bndiff2, bndiff, hprebn, bnmeani, embcat, emb, logprobs, probs, counts, counts_sum, counts_sum_inv, norm_logits, logit_maxes = [params[i] for i in range(len(params))]
@@ -333,6 +339,126 @@ def backprop(params, parameters, Y):
 	# HAS to be direction of 0 because you need to eliminate the 32 dimension
 	d_b2 = d_logits.sum(0)
 	cmp('b2', d_b2, b2)
+
+
+	# dLoss/dhpreact = dLoss/dh * dh/dhpreact
+	# h = tanh(hpreact)
+	# y = tanh(x)
+	# dy/dx = 1 - tanh(x)^2
+	# dh/dhpreact = 1 - h^2
+	d_hpreact = (1 - h**2) * d_h
+	cmp('hpreact', d_hpreact, hpreact)
+
+	# dLoss/dbngain = dLoss/dhpreact * dhpreact/dbngain
+	# hpreact(32,64) = bngain(1,64) * bnraw(32,64) + bnbias(1,64) (scale and shift)
+	# bngain is casted as 32,64 to elementwise multiply bnraw
+	# dhpreact/dbngain = bnraw
+	d_bngain = (bnraw * d_hpreact).sum(0, keepdim=True)	# (32,64)*(32,64) should be a (1,64) --> sum across examples
+	cmp('bngain', d_bngain, bngain)
+
+	# dLoss/bnraw = dLoss/hpreact * dhpreact/dbnraw
+	# dhpreact/dbnraw = bngain
+	d_bnraw = bngain * d_hpreact		# (32,64) = (1,64)*(32,64)
+	cmp('bnraw', d_bnraw, bnraw)
+
+	# dLoss/dbnbias = dLoss/hpreact * dhpreact/dbnbias
+	# dhpreact/dbnbias = 1
+	d_bnbias = (1.0 * d_hpreact).sum(0, keepdim=True)	# (1, 64) = 1.0 * (32,64)
+	cmp('bnbias', d_bnbias, bnbias)
+
+	# dLoss/dbndiff = dLoss/d_bnraw * d_bnraw/d_bndiff
+	# bnraw(32,64) = bndiff(32,64) * bnvar_inv(1,64)
+	d_bndiff = bnvar_inv * d_bnraw
+	d_bnvar_inv = (bndiff * d_bnraw).sum(0, keepdim=True) #bnvar-inv needs to be 1,64, but is 32,64
+	#cmp('bndiff', d_bndiff, bndiff)	# bndiff is not finished because it is used earlier
+	cmp('bnvar_inv', d_bnvar_inv, bnvar_inv)
+
+
+	# dLoss/dbnvar = dLoss/dbnvar_inv * dbnvar_inv/dbnvar
+	# bnvar_inv = (bnvar + 1e-5)**(-0.5)
+	# dbnvar_inv/dbnvar = -0.5 * (bnvar + 1.e-5)**(-1.5)
+	d_bnvar = d_bnvar_inv * ((-0.5) * (bnvar + 1e-5)**(-1.5))
+	cmp('bnvar', d_bnvar, bnvar)
+
+
+	# bnvar(1, 64), bndiff2(32, 64)
+	# bnvar = 1/(n-1)*(bndiff2).sum(0, keepdim=True)
+	# y = 1/(n-1) * x.sum(0) (sum over columns)
+	# sum in the forward pass = replication in the backward pass
+	# a11 a12
+	# a21 a22
+	# --->
+	# b1, b2
+	# b1 = 1/(n-1)*(a11 + a21) (32 times)
+	# b2 = 1/(n-1)*(a21 + a22)
+	# db1/da = 1/(n-1) * number of as
+	d_bndiff2 = (1.0/(n-1))*torch.ones_like(bndiff2) * d_bnvar  # (32, 64)*(1, 64)
+	cmp('bndiff2', d_bndiff2, bndiff2)
+
+	# dLoss/dbndiff = dLoss/dbndiff2 * dbndiff2/dbndiff
+	# bndiff2 = bndiff^2
+	# dbndiff2/dbndiff = 2 * bndiff
+	d_bndiff += (d_bndiff2 * 2 * bndiff)
+	cmp('bndiff', d_bndiff, bndiff)
+
+
+	# dLoss/dbnmeani = dLoss/dbndiff * dbndiff/dbnmeani
+	# bndiff = hprebn - bnmeani
+	# dbndiff/dbnmeani = -1
+	d_bnmeani = (-1.0) * (d_bndiff.sum(0, keepdim=True)) # (1, 64), (32,64)
+	cmp('bnmeani', d_bnmeani, bnmeani)
+
+
+	# dLoss/dhprebn = dLoss/dbndiff * dbndiff/dhprebn + dLoss/dbnmeani * dbnmeani/dhprebn
+	# bndiff = hprebn - bnmeani
+	# dbndiff/dhprebn = 1.0
+	#
+	# bnmeani = 1 / n * hprebn.sum(0, keepdim=True) (1,64) = 1/n (32,64).sum(0)
+	# bnmeani is (1, 64), so need to cast to (32,64)
+	d_hprebn = (1.0) * d_bndiff
+	d_hprebn += (1.0 / n) * torch.ones_like(hprebn) * d_bnmeani
+	cmp('hprebn', d_hprebn, hprebn)
+
+	# hprebn = embcat @ W1 + b1
+	# hprebn(32, 64) = embcat(32,30)@W1(30,64) + (64)
+	# dLoss/dembcat(32,30) = dLoss/dhprebn(32,64) * dhprebn/dembcat(64,30)
+	d_embcat = d_hprebn @ W1.T
+	cmp('embcat', d_embcat, embcat)
+
+	# dLoss/W1(30,64) =  dhprebn/dW1(30,32) @ dLoss/dhprebn(32,64)
+	d_W1 = embcat.T @ d_hprebn
+	cmp('W1', d_W1, W1)
+
+	# dLoss/db1(64) = dLoss/dhprebn(32,64) * dhprebn/db1(64)
+	# dhprebn/db1 = 1.0
+	d_b1 = d_hprebn.sum(0)
+	cmp('b1', d_b1, b1)
+
+	# dLoss/demb (32, 3, 10) = dLoss/dembcat(32, 30) * dembcat/demb(32, 3, 10)
+	# embcat = emb.view(emb.shape[0], -1)
+	d_emb = d_embcat.view(emb.shape)
+	cmp('emb', d_emb, emb)
+
+	# emb = C[Xb]
+	# emb(32, 3, 10)
+	# C(27, 10)
+	# Xb(32, 3)
+	# Xb will have chunks of 3 characters (1, 1, 4)
+	# each integer will specify which row of C to get the 10 features
+	# emb is 32 examples by 3 chars by 10 features
+	# dLoss/dC (27,10) = dLoss/demb (32, 3, 10) * demb/dCs ()
+
+	dC = torch.zeros_like(C) # (27x10)
+
+	# Iterate through elements at Xb (32, 3)
+	for k in range(X.shape[0]):
+		for j in range(X.shape[1]):
+			ix = X[k, j]
+			# forward: took row of C at ix and deposited it at emb at [k, j]
+			dC[ix] += d_emb[k, j]	# have to += since the same rows can be used multiple times.
+
+	cmp('C', dC, C)
+
 
 def cmp(s, dt, t):
 	ex = torch.all(dt == t.grad).item()		# Exact result
@@ -471,7 +597,7 @@ def main():
 	loss, logits, params = forward_bn(Xb, parameters, Yb)
 	
 	parameters, params = backward(loss, parameters, params)
-	backprop(params, parameters, Yb)
+	backprop(params, parameters, Xb, Yb)
 
 main()
 
