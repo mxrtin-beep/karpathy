@@ -141,7 +141,12 @@ def get_loss(logits, Y):
 		logprobs, probs, counts, counts_sum, counts_sum_inv,
 		norm_logits, logit_maxes
 	]
+
+	# return F.cross_entropy(logits, Y)		# Almost exact same loss, but much faster.
 	return loss, params
+
+def fast_loss(logits, Y):
+	return F.cross_entropy(logits, Y)
 
 
 def forward_bn(X, parameters, Y):
@@ -187,6 +192,41 @@ def forward_bn(X, parameters, Y):
 	total_params = params + loss_params
 	return loss, logits, total_params
 
+def fast_forward(X, parameters, sample=False):
+	n = 32
+	C, W1, b1, W2, b2, bngain, bnbias = [parameters[i] for i in range(len(parameters))]
+
+	emb = C[X] # (32, 3, 2); embed the characters into vectors
+	embcat = emb.view(emb.shape[0], -1)	# concatenate the vectors
+
+
+	# Linear Layer 1
+	hprebn = embcat @ W1 + b1
+
+	#hpreact = bngain * (hprebn - hprebn.mean(0, keepdim=True)) / torch.sqrt(hprebn.var(0, keepdim=True, unbiased=True))
+	bnmean = hprebn.mean(0, keepdim=True)
+
+	if sample:
+		bnvar = hprebn.var(0, keepdim=True, unbiased=False)
+		if bnvar[0,0] != 0:
+			bnvar = hprebn.var(0, keepdim=True, unbiased=True)
+	else:
+		bnvar = hprebn.var(0, keepdim=True, unbiased=True)
+	bnvar_inv = (bnvar + 1e-5)**-0.5
+	bnraw = (hprebn - bnmean) * bnvar_inv
+	hpreact = bngain * bnraw + bnbias
+
+	h = torch.tanh(hpreact)
+
+	# Linear layer 2
+	logits = h @ W2 + b2 	# Output layer
+
+	# Cross-Entropy Loss
+	#loss = F.cross_entropy(logits, Y)
+
+	fast_params = [logits, h, hpreact, bnraw, bnvar_inv, bnvar, hprebn, bnmean, embcat, emb]
+
+	return fast_params, logits
 
 def backward(loss, parameters, params, learning_rate = 0.01):
 
@@ -299,6 +339,9 @@ def backprop(params, parameters, X, Y):
 	# Multiply 32x27 with 32x1 column of d_logit_maxes, which will get broadcast to 32x27 and
 	# elementwise multiply
 	cmp('logits', d_logits, logits)
+
+	#fast_d_logits = fast_loss_backprop(logits, Y)
+	#cmp('fast logits', fast_d_logits, logits)
 
 	# logits(32,27) = h(32,64) @ W2(64,27) + b2(27)
 	# d = a@b + c
@@ -460,6 +503,51 @@ def backprop(params, parameters, X, Y):
 	cmp('C', dC, C)
 
 
+def fast_backprop(params, parameters, X, Y):
+
+	n = 32
+	logits, h, hpreact, bnraw, bnvar_inv, bnvar, hprebn, bnmean, embcat, emb = [params[i] for i in range(len(params))]
+
+	C, W1, b1, W2, b2, bngain, bnbias = [parameters[i] for i in range(len(parameters))]
+
+	# D_logits
+	d_logits = F.softmax(logits, 1)	# softmax along rows
+	d_logits[range(n), Y] -= 1
+	d_logits /= n
+
+	# 2nd layer
+	d_h = d_logits @ W2.T
+	d_W2 = h.T @ d_logits
+	d_b2 = d_logits.sum(0)
+
+	# tanh
+	d_hpreact = (1.0 - h**2) * d_h
+
+	# batchnorm
+	d_bngain = (bnraw * d_hpreact).sum(0, keepdim=True)	# (32,64)*(32,64) should be a (1,64) --> sum across examples
+	d_bnraw = bngain * d_hpreact		# (32,64) = (1,64)*(32,64)
+	d_bnbias = (1.0 * d_hpreact).sum(0, keepdim=True)	# (1, 64) = 1.0 * (32,64)
+
+	d_hprebn = bngain*bnvar_inv / n * (n * d_hpreact - d_hpreact.sum(0) - n/(n-1) * bnraw*(d_hpreact*bnraw).sum(0))
+
+	# 1st layer
+	d_embcat = d_hprebn @ W1.T
+	d_W1 = embcat.T @ d_hprebn
+	d_b1 = d_hprebn.sum(0)
+
+	# embedding
+	d_emb = d_embcat.view(emb.shape)
+	d_C = torch.zeros_like(C)
+	for k in range(X.shape[0]):
+		for j in range(X.shape[1]):
+			ix = X[k, j]
+			d_C[ix] += d_emb[k, j]
+
+	grads = [d_C, d_W1, d_b1, d_W2, d_b2, d_bngain, d_bnbias]
+
+	return grads
+
+
 def cmp(s, dt, t):
 	ex = torch.all(dt == t.grad).item()		# Exact result
 	app = torch.allclose(dt, t.grad)			# Checks for approximately close result
@@ -526,34 +614,6 @@ def get_whole_means(X, parameters):
 # 	The quality of the gradient goes down, but it's much faster.
 # 	Better to have a worse gradient and iterate 10x more.
 
-# Can't sample with batch norm, because the stdev of 1 item is 0.
-def sample(n_samples, block_size, parameters, seeded=False, mean=0, std=0):
-
-	for i in range(n_samples):
-		out = []
-		context = [0]*block_size
-		itos = get_itos(words)
-
-		while True:
-
-			X = torch.tensor([context])
-
-			logits = forward_normalize(torch.tensor([context]), parameters, mean, std)
-
-			probs = F.softmax(logits, dim=1)
-			#print(probs)
-			if seeded:
-				ix = torch.multinomial(probs, num_samples=1, generator=g).item()
-			else:
-				ix = torch.multinomial(probs, num_samples=1).item()
-			context = context[1:] + [ix]
-			out.append(ix)
-
-			if ix==0:
-				break
-		print(''.join(itos[i] for i in out))
-
-
 # Another problem
 # When you calculate y = x @ w, where x and w are Gaussian distributions,
 # the stdev of y increases, which we don't want.
@@ -573,6 +633,31 @@ def sample(n_samples, block_size, parameters, seeded=False, mean=0, std=0):
 # 	Not normalized --> kaiming normalization of weights by 5/3 / sqrt(fan_in)
 # 	Batch Normalization --> normalize hidden layer activations to be Gaussian + scale and shift
 
+def sample(n_samples, block_size, parameters, seeded=False):
+
+	for i in range(n_samples):
+		out = []
+		context = [0]*block_size
+		itos = get_itos(words)
+
+		while True:
+
+			X = torch.tensor([context])
+			#print(X)
+			fast_params, logits = fast_forward(X, parameters, sample=True)
+			#print(logits)
+			probs = F.softmax(logits, dim=1)
+
+			if seeded:
+				ix = torch.multinomial(probs, num_samples=1, generator=g).item()
+			else:
+				ix = torch.multinomial(probs, num_samples=1).item()
+			context = context[1:] + [ix]
+			out.append(ix)
+
+			if ix==0:
+				break
+		print(''.join(itos[i] for i in out))
 
 def main():
 
@@ -591,13 +676,40 @@ def main():
 	X_tr, Y_tr, X_dev, Y_dev, X_te, Y_te = get_split_data(words)
 
 	batch_size = 32
-	ix = torch.randint(0, X_tr.shape[0], (batch_size, ), generator=g)
-	Xb, Yb = X_tr[ix], Y_tr[ix]
-
-	loss, logits, params = forward_bn(Xb, parameters, Yb)
 	
-	parameters, params = backward(loss, parameters, params)
-	backprop(params, parameters, Xb, Yb)
+	N_steps = 10000
+
+	for i in range(N_steps):
+
+		ix = torch.randint(0, X_tr.shape[0], (batch_size, ), generator=g)
+		Xb, Yb = X_tr[ix], Y_tr[ix]
+
+		#loss, logits, params = forward_bn(Xb, parameters, Yb)
+		fast_params, logits = fast_forward(Xb, parameters)
+
+		loss = fast_loss(logits, Yb)
+		
+		#parameters, params = backward(loss, parameters, params)
+		#backprop(params, parameters, Xb, Yb)
+
+		for p in parameters:
+			p.grad = None
+		
+		grads = fast_backprop(fast_params, parameters, Xb, Yb)
+
+		lr = 0.1
+
+		for p, grad in zip(parameters, grads):
+			p.data += -lr * grad
+
+		if i % (N_steps/10) == 0:
+			print(f'{i:7d}/{N_steps:7d}: {loss.item():.4f}')
+
+	fast_params, logits = fast_forward(X_dev, parameters)
+	loss = fast_loss(logits, Y_dev)
+	print("Dev Loss: ", loss.item())
+
+	sample(10, 3, parameters, seeded=False)
 
 main()
 
