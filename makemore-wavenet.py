@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import random
-
+import numpy as np
 
 # --------------------------------------- SUMMARY ---------------------------------------
 '''
@@ -50,6 +50,16 @@ Linear : (4, 27)
 
 
 '''
+block_size = 8
+
+
+n_embd = 10
+n_hidden = 100
+
+max_steps = 50000
+batch_size = 32
+
+n_samples = 30
 
 # --------------------------------------- BUILDING DATASET ---------------------------------------
 
@@ -64,9 +74,8 @@ stoi['.'] = 0
 itos = {i:s for s,i in stoi.items()}
 
 vocab_size = len(itos) 	# 27
-block_size = 8
 
-random.seed(42)
+#random.seed(42)
 random.shuffle(words)
 
 def build_dataset(words):
@@ -121,6 +130,8 @@ class Linear:
 		return [self.weight] + ([] if self.bias is None else [self.bias])
 
 
+# Problem: only works for 1 dimension
+# (32, 4, 68) --> (1, 4, 68); want to normalize 32*4 numbers
 class BatchNorm1d:
 
 	def __init__(self, dim, eps=1e-5, momentum=0.1):
@@ -140,8 +151,16 @@ class BatchNorm1d:
 
 		# Forward Pass
 		if self.training:
-			xmean = x.mean(0, keepdim=True) 				# Batch mean
-			xvar = x.var(0, keepdim=True, unbiased=True) 	# Batch variance
+
+
+			if x.ndim == 2: # (32, 100) --> (1, 100)
+				dim = 0
+			elif x.ndim == 3: # (32, 4, 68) --> (1, 1, 68) instead of (1, 4, 68)
+				dim = (0, 1)
+				# Departure from pytorch: torch would batchnorm over (0th and 2nd layers, not 0th and 1st)
+
+			xmean = x.mean(dim, keepdim=True) 				# Batch mean
+			xvar = x.var(dim, keepdim=True, unbiased=True) 	# Batch variance
 		else:
 			xmean = self.running_mean
 			xvar = self.running_var
@@ -236,10 +255,8 @@ class Sequential:
 
 # --------------------------------------- NETWORK ARCHITECTURE ---------------------------------------
 
-torch.manual_seed(42)
+#torch.manual_seed(42)
 
-n_embd = 10
-n_hidden = 68
 
 # If you don't have the Tanh layers, your activations will explode.
 # Also, your whole network will be one linear function.
@@ -267,8 +284,6 @@ for p in parameters:
 # --------------------------------------- OPTIMIZATION ---------------------------------------
 
 
-max_steps = 1000
-batch_size = 4
 lossi = []
 
 
@@ -300,7 +315,8 @@ for i in range(max_steps):
 		print(f'{i:7d}/{max_steps:7d}: {loss.item():.4f}')
 	lossi.append(loss.log10().item())
 
-model.print_layers()
+
+#model.print_layers()
 
 # Split lossi into 200 rows of 1000 samples, take the mean of each row
 lossi_avg = torch.tensor(lossi).view(-1, 1000).mean(1)	
@@ -325,12 +341,13 @@ def split_loss(split):
 
 split_loss('train')
 split_loss('val')
+split_loss('test')
 
 
 # --------------------------------------- SAMPLING ---------------------------------------
 
 
-for _ in range(10):
+for _ in range(n_samples):
 
 	out = []
 	context = [0] * block_size
@@ -353,3 +370,9 @@ for _ in range(10):
 			break
 
 	print(''.join(itos[i] for i in out))
+
+
+torch.save(model.parameters(), 'parameters.txt')
+
+
+p = torch.load('parameters.txt')
