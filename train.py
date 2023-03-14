@@ -50,26 +50,37 @@ def get_batch(split_set, full_data, block_size=8, batch_size=4):
 
 class BigramLanguageModel(nn.Module):
 
-	def __init__(self, vocab_size):
+	def __init__(self, n_embd, block_size):
 		super().__init__()
 
-		# Creates a tensor of shape (vocab_size, vocab_size)
+		# Creates a tensor of shape (vocab_size, n_embd)
 		# When you call forward with an idx, it will pluck out a row at that index
 		# from the embedding table
-		self.token_embedding_table = nn.Embedding(vocab_size, vocab_size)
+		self.token_embedding_table = nn.Embedding(vocab_size, n_embd)		# (V, C)
+		self.position_embedding_table = nn.Embedding(block_size, n_embd)	# each position from 0 block_size-1 will get an embedding
+		self.lm_head = nn.Linear(n_embd, vocab_size)						# (C, V)
 
 	# Targets needs to be optional if you just want logits.
 	def forward(self, idx, targets=None):
 
+		# 4 (B) examples of 8 (T) tokens
+		# Each one has 32 dimensions
+		B, T = idx.shape
+		
 		# idx and targets are both (B, T) tensor of integers
 
-		# Creates (B, T, C)
-		# B: batch 		(4)
-		# T: time 		(8)
-		# C: channels	(65) (vocab_size)
+		# Creates (B, T, C) of token embeddings
+		# B: batch 		(4)  (batch_size)
+		# T: time 		(8)	 (block_size)
+		# C: channels	(32) (n_embed)
 		# Logits are the scores of the next character in the sequence.
 		# Predict what comes next based on identity of ONE token.
-		logits = self.token_embedding_table(idx)
+
+		tok_emb = self.token_embedding_table(idx) # (B, T, C)
+		pos_emb = self.position_embedding_table(torch.arange(T, device=device))	# (T, C)
+		#print(torch.arange(T))
+		x = tok_emb + pos_emb 		# (B, T, C)
+		logits = self.lm_head(x)	# (B, T, V)
 
 		if targets is None:
 			loss = None
@@ -115,7 +126,6 @@ class BigramLanguageModel(nn.Module):
 		context = torch.zeros((1, 1), dtype=torch.long, device=device)
 
 		gen_tensor = self.generate(context, max_new_tokens=max_new_tokens)
-		#print(gen_tensor.shape)
 		gen_list = gen_tensor[0].tolist() # Index at 0 to pluck out Batch dimension.
 		return decode(gen_list)
 
@@ -123,7 +133,13 @@ class BigramLanguageModel(nn.Module):
 
 		optimizer = torch.optim.AdamW(self.parameters(), lr=1e-3)
 
-		for steps in range(n_steps):
+		for i in range(n_steps):
+
+			if i % (n_steps/10) == 0:
+				losses = self.estimate_loss(data, eval_iters=200)
+				train_loss = losses['train']
+				val_loss = losses['val']
+				print(f'Step: {i}; train loss: {train_loss:.4f}, val loss: {val_loss:.4f}')
 
 			xb, yb = get_batch('train', data)
 
@@ -133,6 +149,98 @@ class BigramLanguageModel(nn.Module):
 			optimizer.step()
 
 		print(loss.item())
+
+
+
+	@torch.no_grad() # Faster, because not storing gradients for backprop.
+	def estimate_loss(self, data, eval_iters):
+
+		out = {}
+		self.eval()	# Set to evaluation mode. Some layers like BatchNorm act differently.
+
+		for split in ['train', 'val']:
+			losses = torch.zeros(eval_iters)
+			for k in range(eval_iters):
+				X, Y = get_batch(split, data)
+				logits, loss = self(X, Y)
+				losses[k] = loss.item()
+			out[split] = losses.mean()
+
+		self.train() # Set back to training mode.
+		return out
+
+
+
+# X is a (B, T, C) matrix
+# Get a matrix that is the same shape, but each row
+# is an average of all the previous characters.
+
+# Wei (T, T) @ (B, T, C) --> (B, T, T) @ (B, T, C) --> (B, T, C)
+def get_xbows(X):
+
+	B = X.shape[0]
+	T = X.shape[1]
+	C = X.shape[2]
+
+	# One head performing self-attention.
+	# Each token will have 2 dimensions that it gives:
+	# 	key: what it is.
+	# 	query: what it wants.
+	# Will compute the dot product of one key with all the queries.
+	# If key and query are aligned, they will have a high dot product.
+	head_size = 16
+	key = nn.Linear(C, head_size, bias=False)	# (32 in, 16 out)
+	query = nn.Linear(C, head_size, bias=False)	# (32 in, 16 out)
+	value = nn.Linear(C, head_size, bias=False)	# (32 in, 16 out)
+
+	# Converts C (32 dimensions of each char) to 16 keys and queries.
+	k = key(X)		# (B, T, 16)
+	q = query(X)	# (B, T, 16)
+
+	# Affinities
+	wei = q @ k.transpose(-2, -1)	# (B, T, 16) @ (B, 16, T) --> (B, T, T)
+	# For every row of B (for every batch), you will have a TxT array of affinities.
+	# Wei: (B, T, T) random array of weights.s
+
+	# Triangular matrix
+	# Bottom triangle is ones, upper triangle is zeroes.
+	tril = torch.tril(torch.ones(T, T))
+
+	# Triangular matrix (weights).
+	# Bottom triangle is zeroes, upper triangle is -inf.
+	# Now, weigh is lower triangular.
+	wei = wei.masked_fill(tril == 0, float('-inf'))	# Tokens from the past cannot communicate.
+
+	# Exponentiate (0 --> 1, -inf --> 0)
+	# Take the average (first row: 1; second row: 0.5, 0.5; third row: 0.33, 0.33, 0.33, etc.)
+	wei = F.softmax(wei, dim=-1)
+	# Now, all rows of wei sum to 1.
+
+	# v is the thing that gets communicated if a token is found interesting.
+	# v is the thing that gets aggregated.
+	v = value(X)	# (B, T, C) --> (B, T, 16)
+
+
+	out = wei @ v
+	return out
+
+
+	# Wei will have a T, T array for each 8-char word in the batch.
+	# The array will be a lower triangular array.
+	# Instead of have them all be 
+	#	[1.0, 0.0, 0.0]
+	#	[0.5, 0.5, 0.0]
+	#	[0.3, 0.3, 0.3]
+
+	# Each of them will be different (initialized randomly) and normalized to sum to 1 again.
+	# For example: last token of last row:
+	# 	Knows what it is (vowel), knows what position it is --> generates query
+	#	"hey i'm a vowel, i'm looking for any consonants in positions up to 4"
+	#	every channel emits a key (i'm a consonant at position 4) --> that key would have a
+	# 	high number in that specific channel (8th row, 4th position)
+	# 	--> high affinity when they dot product
+	# 	when they have a high affinity, when you softmax, you add a larger portion of its information
+	# 	to your information, and you will learn about it.
 
 def main():
 
@@ -144,6 +252,7 @@ def main():
 
 	block_size = 8		# Maximum size of training chunk
 	batch_size = 32 	# How many independent sequences will we process in parallel?
+	n_embd = 32
 
 
 	# If you have a block_size of 8, you have 8 examples packed into one.
@@ -152,17 +261,18 @@ def main():
 
 	xb, yb = get_batch('train', data)
 
-	model = BigramLanguageModel(vocab_size)
+	model = BigramLanguageModel(n_embd, block_size)
 	m = model.to(device)
 
 	logits, loss = m(xb, yb)
-	print(logits.shape)
 	print(f'Loss: {loss}')
 
 	# Batch is 1, Time is 1, holds a 0 (newLine character).
-	print(m.sample(100))
+	#print(m.sample(100))
 
 	m.optimize(10000, batch_size=batch_size, data=data)
+	#print(m.estimate_loss(data, eval_iters=200))
 
-	print(m.sample(100))
+	#print(m.sample(100))
+
 main()
