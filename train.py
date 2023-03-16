@@ -23,6 +23,9 @@ decode = lambda l: ''.join([itos[i] for i in l])
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+block_size = 8		# Maximum size of training chunk
+batch_size = 32 	# How many independent sequences will we process in parallel?
+n_embd = 32
 
 
 
@@ -34,7 +37,7 @@ def split(data):
 
 	return train_data, val_data
 
-def get_batch(split_set, full_data, block_size=8, batch_size=4):
+def get_batch(split_set, full_data):
 
 	train_data, val_data = split(full_data)
 
@@ -54,7 +57,7 @@ class Head(nn.Module):
 	''' One head of self-attention '''
 
 
-	def __init__(self, head_size, n_embd, block_size):
+	def __init__(self, head_size):
 		super().__init__()
 		self.key = nn.Linear(n_embd, head_size, bias=False)
 		self.query = nn.Linear(n_embd, head_size, bias=False)
@@ -77,21 +80,45 @@ class Head(nn.Module):
 		return out
 
 
+class MultiHeadAttention(nn.Module):
+	''' Multiple heads of self-attention in parallel '''
+
+	def __init__(self, num_heads, head_size):
+		super().__init__()
+		self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+
+	def forward(self, x):
+		return torch.cat([h(x) for h in self.heads], dim=-1)
+
+
+class FeedForward(nn.Module):
+	''' A simple linear layer followed by non-linearity '''
+
+	def __init__(self, n_embd):
+		super().__init__()
+		self.net = nn.Sequential(
+			nn.Linear(n_embd, n_embd),
+			nn.ReLU()
+		)
+
+	def forward(self, x):
+		return self.net(x)
 
 
 class BigramLanguageModel(nn.Module):
 
-	def __init__(self, n_embd, block_size):
+	def __init__(self):
 		super().__init__()
 
-		self.n_embd = n_embd
-		self.block_size = block_size
 		# Creates a tensor of shape (vocab_size, n_embd)
 		# When you call forward with an idx, it will pluck out a row at that index
 		# from the embedding table
 		self.token_embedding_table = nn.Embedding(vocab_size, n_embd)		# (V, C)
 		self.position_embedding_table = nn.Embedding(block_size, n_embd)	# each position from 0 block_size-1 will get an embedding
-		self.sa_head = Head(n_embd, n_embd, block_size)
+		
+		#self.sa_head = Head(n_embd, n_embd, block_size)
+		self.sa_heads = MultiHeadAttention(4, n_embd//4)	# Instead of one SA head of dim 32, want 4 heads of 8-dim SA.
+		self.ffwd = FeedForward(n_embd)
 		self.lm_head = nn.Linear(n_embd, vocab_size)						# (C, V)
 
 	# Targets needs to be optional if you just want logits.
@@ -114,7 +141,8 @@ class BigramLanguageModel(nn.Module):
 		pos_emb = self.position_embedding_table(torch.arange(T, device=device))	# (T, C)
 		#print(torch.arange(T))
 		x = tok_emb + pos_emb 		# (B, T, C)
-		x = self.sa_head(x)			# (B, T, C) apply one head of self-attention
+		x = self.sa_heads(x)		# (B, T, C) apply a few heads of self-attention.
+		x = self.ffwd(x)			# (B, T, C)	allows nodes to think on what they get from self-attention.
 		logits = self.lm_head(x)	# (B, T, V)
 
 		if targets is None:
@@ -143,7 +171,7 @@ class BigramLanguageModel(nn.Module):
 			# With self-attention, can never have more than
 			# block_size coming in.
 			# Get the last block_size tokens.
-			idx_cond = idx[:, -self.block_size:]
+			idx_cond = idx[:, -block_size:]
 
 
 			logits, loss = self(idx_cond)
@@ -312,15 +340,11 @@ def get_xbows(X):
 
 def main():
 
-	torch.manual_seed(1389)
+	torch.manual_seed(1337)
 
 	data = torch.tensor(encode(text), dtype=torch.long)
 	print(data.shape, data.dtype)
 	
-
-	block_size = 8		# Maximum size of training chunk
-	batch_size = 32 	# How many independent sequences will we process in parallel?
-	n_embd = 32
 
 
 	# If you have a block_size of 8, you have 8 examples packed into one.
@@ -329,7 +353,7 @@ def main():
 
 	xb, yb = get_batch('train', data)
 
-	model = BigramLanguageModel(n_embd, block_size)
+	model = BigramLanguageModel()
 	m = model.to(device)
 
 	logits, loss = m(xb, yb)
@@ -338,7 +362,7 @@ def main():
 	# Batch is 1, Time is 1, holds a 0 (newLine character).
 	#print(m.sample(100))
 
-	m.optimize(10000, batch_size=batch_size, data=data)
+	m.optimize(5000, batch_size=batch_size, data=data)
 	#print(m.estimate_loss(data, eval_iters=200))
 
 	print(m.sample(400))
