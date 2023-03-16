@@ -120,15 +120,43 @@ class Block(nn.Module):
 		head_size = n_embd // n_head
 		self.sa = MultiHeadAttention(n_head, head_size)
 		self.ffwd = FeedForward(n_embd)
+		self.ln1 = nn.LayerNorm(n_embd)
+		self.ln2 = nn.LayerNorm(n_embd)
 
 	def forward(self, x):
 
 		# The reason we do x = x + instead of x = x
 		# is to have residual connections.
 		# We fork off and do some computation and come back.
-		x = x + self.sa(x)
-		x = x + self.ffwd(x)
+		# Some papers apply layernorm after SA and FFWD, but now it's more common
+		# to apply it before, like in here.
+		x = x + self.sa(self.ln1(x))
+		x = x + self.ffwd(self.ln2(x))
 		return x
+
+
+# Same as torch.nn.LayerNorm
+# Very important for deeper networks.
+class LayerNorm(nn.Module):
+
+	def __init__(self, dim, eps=1e-5, momentum=0.1):
+		super().__init__()
+		self.eps = eps
+		self.gamma = torch.ones(dim)
+		self.beta = torch.zeros(dim)
+
+	def __call__(self, x):
+		# Forward Pass.
+		xmean = x.mean(1, keepdim=True)	# Layer Mean
+		xvar = x.var(1, keepdim=True) 	# Layer Variance
+		xhat = (x - xmean) / torch.sqrt(xvar + self.eps)
+		self.out = self.gamma * xhat + self.beta
+		return self.out
+
+	def parameters(self):
+		return [self.gamma, self.beta]
+
+
 
 class BigramLanguageModel(nn.Module):
 
@@ -150,6 +178,7 @@ class BigramLanguageModel(nn.Module):
 			Block(n_embd, n_head = 4),
 			Block(n_embd, n_head = 4),
 			Block(n_embd, n_head = 4),
+			nn.LayerNorm(n_embd),
 		)
 		self.lm_head = nn.Linear(n_embd, vocab_size)						# (C, V)
 
@@ -398,7 +427,7 @@ def main():
 	# Batch is 1, Time is 1, holds a 0 (newLine character).
 	#print(m.sample(100))
 
-	m.optimize(5000, batch_size=batch_size, data=data)
+	m.optimize(100, batch_size=batch_size, data=data)
 	#print(m.estimate_loss(data, eval_iters=200))
 
 	print(m.sample(400))
