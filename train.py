@@ -23,11 +23,27 @@ decode = lambda l: ''.join([itos[i] for i in l])
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-block_size = 8		# Maximum size of training chunk
-batch_size = 32 	# How many independent sequences will we process in parallel?
-n_embd = 32
+block_size = 32		# Maximum size of training chunk
+batch_size = 8 		# How many independent sequences will we process in parallel?
+n_embd = 384
+n_layer = 2
+n_head = 6
+dropout = 0.2
 
+'''
+Ideally have:
+	block_size = 256
+	batch_size = 64
+	max_iters = 5000
+	lr = 3e-4
+	n_embd = 384
+	n_head = 6
+	n_layer = 6
+	dropout = 0.2
 
+Too slow to run on CPU
+
+'''
 
 def split(data):
 
@@ -64,6 +80,8 @@ class Head(nn.Module):
 		self.value = nn.Linear(n_embd, head_size, bias=False)
 		self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
+		self.dropout = nn.Dropout(dropout)
+
 	def forward(self, x):
 		B, T, C = x.shape
 		k = self.key(x)		# (B, T, C)
@@ -73,6 +91,7 @@ class Head(nn.Module):
 		wei = q @ k.transpose(-2, -1) * C**-0.5 	# (B, T, C) @ (B, C, T) = (B, T, T)
 		wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))	# (B, T, T) decoder block
 		wei = F.softmax(wei, dim=-1)	# (B, T, T)
+		wei = self.dropout(wei)
 
 		# Weighted aggregation of the values.
 		v = self.value(x)	# (B, T, C)
@@ -87,11 +106,12 @@ class MultiHeadAttention(nn.Module):
 		super().__init__()
 		self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
 		self.proj = nn.Linear(n_embd, n_embd)	# Projection back into linear pathway.
-
+		self.dropout = nn.Dropout(dropout)
 
 	def forward(self, x):
 		out = torch.cat([h(x) for h in self.heads], dim=-1)	# Output of self-attention.
-		out = self.proj(out)								# Linear transformation of output of self-attention.
+		out = self.dropout(self.proj(out))							# Linear transformation of output of self-attention.
+
 		return out
 
 
@@ -104,6 +124,7 @@ class FeedForward(nn.Module):
 			nn.Linear(n_embd, 4 * n_embd),		# Multiply by 4 because that's what the paper does.
 			nn.ReLU(),
 			nn.Linear(4 * n_embd, n_embd),		# Projection layer going back into residual pathway.
+			nn.Dropout(dropout),				# Dropout right before going back to residual.
 		)
 
 	def forward(self, x):
@@ -173,13 +194,8 @@ class BigramLanguageModel(nn.Module):
 		#self.sa_head = Head(n_embd, n_embd, block_size)
 		#self.sa_heads = MultiHeadAttention(4, n_embd//4)	# Instead of one SA head of dim 32, want 4 heads of 8-dim SA.
 		#self.ffwd = FeedForward(n_embd)
-
-		self.blocks = nn.Sequential(
-			Block(n_embd, n_head = 4),
-			Block(n_embd, n_head = 4),
-			Block(n_embd, n_head = 4),
-			nn.LayerNorm(n_embd),
-		)
+		self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+		self.ln_f = nn.LayerNorm(n_embd)	# Final LayerNorm
 		self.lm_head = nn.Linear(n_embd, vocab_size)						# (C, V)
 
 
@@ -303,8 +319,12 @@ class BigramLanguageModel(nn.Module):
 		return out
 
 
+	def write_to_file(self, n_chars, filename):
 
-
+		chars = self.sample(n_chars)
+		f = open(filename, "w")
+		f.write(chars)
+		f.close()
 
 
 
@@ -427,9 +447,11 @@ def main():
 	# Batch is 1, Time is 1, holds a 0 (newLine character).
 	#print(m.sample(100))
 
-	m.optimize(100, batch_size=batch_size, data=data)
+	m.optimize(5000, batch_size=batch_size, data=data)
 	#print(m.estimate_loss(data, eval_iters=200))
 
 	print(m.sample(400))
+
+	m.write_to_file(10000, 'test.txt')
 
 main()
