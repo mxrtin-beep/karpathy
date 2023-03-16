@@ -48,16 +48,50 @@ def get_batch(split_set, full_data, block_size=8, batch_size=4):
 	return x, y
 
 
+
+
+class Head(nn.Module):
+	''' One head of self-attention '''
+
+
+	def __init__(self, head_size, n_embd, block_size):
+		super().__init__()
+		self.key = nn.Linear(n_embd, head_size, bias=False)
+		self.query = nn.Linear(n_embd, head_size, bias=False)
+		self.value = nn.Linear(n_embd, head_size, bias=False)
+		self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+
+	def forward(self, x):
+		B, T, C = x.shape
+		k = self.key(x)		# (B, T, C)
+		q = self.query(x)	# (B, T, C)
+
+		# Attention scores (affinities)
+		wei = q @ k.transpose(-2, -1) * C**-0.5 	# (B, T, C) @ (B, C, T) = (B, T, T)
+		wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))	# (B, T, T) decoder block
+		wei = F.softmax(wei, dim=-1)	# (B, T, T)
+
+		# Weighted aggregation of the values.
+		v = self.value(x)	# (B, T, C)
+		out = wei @ v 	# (B, T, T) @ (B, T, C) = (B, T, C)
+		return out
+
+
+
+
 class BigramLanguageModel(nn.Module):
 
 	def __init__(self, n_embd, block_size):
 		super().__init__()
 
+		self.n_embd = n_embd
+		self.block_size = block_size
 		# Creates a tensor of shape (vocab_size, n_embd)
 		# When you call forward with an idx, it will pluck out a row at that index
 		# from the embedding table
 		self.token_embedding_table = nn.Embedding(vocab_size, n_embd)		# (V, C)
 		self.position_embedding_table = nn.Embedding(block_size, n_embd)	# each position from 0 block_size-1 will get an embedding
+		self.sa_head = Head(n_embd, n_embd, block_size)
 		self.lm_head = nn.Linear(n_embd, vocab_size)						# (C, V)
 
 	# Targets needs to be optional if you just want logits.
@@ -80,6 +114,7 @@ class BigramLanguageModel(nn.Module):
 		pos_emb = self.position_embedding_table(torch.arange(T, device=device))	# (T, C)
 		#print(torch.arange(T))
 		x = tok_emb + pos_emb 		# (B, T, C)
+		x = self.sa_head(x)			# (B, T, C) apply one head of self-attention
 		logits = self.lm_head(x)	# (B, T, V)
 
 		if targets is None:
@@ -105,7 +140,13 @@ class BigramLanguageModel(nn.Module):
 
 		for _ in range(max_new_tokens):
 
-			logits, loss = self(idx)
+			# With self-attention, can never have more than
+			# block_size coming in.
+			# Get the last block_size tokens.
+			idx_cond = idx[:, -self.block_size:]
+
+
+			logits, loss = self(idx_cond)
 
 			# Focus only on last time step.
 			logits = logits[:, -1, :]	# Becomes (B, C) from (B, T, C), plucks out last T.
@@ -148,7 +189,6 @@ class BigramLanguageModel(nn.Module):
 			loss.backward()
 			optimizer.step()
 
-		print(loss.item())
 
 
 
@@ -168,6 +208,11 @@ class BigramLanguageModel(nn.Module):
 
 		self.train() # Set back to training mode.
 		return out
+
+
+
+
+
 
 
 
@@ -198,9 +243,12 @@ def get_xbows(X):
 	q = query(X)	# (B, T, 16)
 
 	# Affinities
-	wei = q @ k.transpose(-2, -1)	# (B, T, 16) @ (B, 16, T) --> (B, T, T)
+	wei = q @ k.transpose(-2, -1) * head_size**-0.5	# (B, T, 16) @ (B, 16, T) --> (B, T, T)
 	# For every row of B (for every batch), you will have a TxT array of affinities.
 	# Wei: (B, T, T) random array of weights.s
+	# Divide by squareroot of head_size to keep the variance 1.
+	# Otherwise, if you have very positive and negative numbers, softmax will converge to one hot encoding,
+	# and you will only get info from the largest node.
 
 	# Triangular matrix
 	# Bottom triangle is ones, upper triangle is zeroes.
@@ -209,6 +257,8 @@ def get_xbows(X):
 	# Triangular matrix (weights).
 	# Bottom triangle is zeroes, upper triangle is -inf.
 	# Now, weigh is lower triangular.
+	# If you remove this line, all the characters will communicate with each other.
+	# ENCODER blocks don't have this, DECODER blocks do.
 	wei = wei.masked_fill(tril == 0, float('-inf'))	# Tokens from the past cannot communicate.
 
 	# Exponentiate (0 --> 1, -inf --> 0)
@@ -220,6 +270,19 @@ def get_xbows(X):
 	# v is the thing that gets aggregated.
 	v = value(X)	# (B, T, C) --> (B, T, 16)
 
+	# Can imagine a directed graph of nodes.
+	# Every node has a vector of info; can aggregate info from a weighted sum of
+	# all the nodes pointing to it.
+	# We have 8 nodes (batch_size).
+	#	First node is only pointed to by itself.
+	#	Second node is only pointed to by itself and the first node.
+	# 	etc.
+	#	Eigth node is pointed to by all the nodes.
+	# NO NOTION OF SPACE; that's why you encode space.
+	# Also, each batch is independent from each other of course.
+	# Future tokens don't communicate to the past tokens, but that is specific to this.
+	# In many cases you might want all of the tokens talk to each other, for example
+	# if you want to get the sentiment of a sentence for example.
 
 	out = wei @ v
 	return out
@@ -241,6 +304,11 @@ def get_xbows(X):
 	# 	--> high affinity when they dot product
 	# 	when they have a high affinity, when you softmax, you add a larger portion of its information
 	# 	to your information, and you will learn about it.
+
+	# This is SELF-ATTENTION, because the same source x produces keys, queries, and values.
+	# Can have CROSS-ATTENTION where that is not the case.
+
+	# In General: Attention(Q, K, V) = softmax((QK.T) / Sqrt(d_k)) *V
 
 def main():
 
@@ -273,6 +341,6 @@ def main():
 	m.optimize(10000, batch_size=batch_size, data=data)
 	#print(m.estimate_loss(data, eval_iters=200))
 
-	#print(m.sample(100))
+	print(m.sample(400))
 
 main()
